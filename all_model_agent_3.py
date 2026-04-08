@@ -1,24 +1,13 @@
-# 把所有的以类作为初始化
-# 方法：get_answer(video_path, idx) 这些的
-# cal_score 给其他智能体评分
-# 获取其他智能体评分
-# 排除掉的智能体在其他地方写。
+# all_model_agent_3_do_sample_false.py 에 이어서
 import copy
 from transformers import AutoTokenizer, AutoProcessor, AutoModel, AutoModelForVision2Seq
 from llava.model.builder import load_pretrained_model
 import torch
-# from longvu.builder import load_pretrained_model_longvu
-# from longvu.conversation import longvu_conv_templates, LongVUSeparatorStyle
-# from longvu.mm_datautils import (
-#     KeywordsStoppingCriteria,
-#     longvu_process_images,
-#     longvu_tokenizer_image_token,
-# )
-
-from decord import cpu, VideoReader  # @manual=fbsource//third-party/pypi/decord:decord
+from decord import cpu, VideoReader
 from torch import distributed as dist
 from tqdm import tqdm
 import json
+import torch.nn.functional as F
 
 from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
 from tqdm import tqdm
@@ -39,26 +28,32 @@ from torchvision.transforms.functional import InterpolationMode
 import torchvision.transforms as T
 from qwen_vl_utils import process_vision_info
 
+import sys
+sys.path.append("/data1/lgagent_0402/model_ckpt/InternVL3-8B")
+
+import conversation as internvl_conversation
+
+
 def get_anno(anno_path):
     # return sample_idx, anno [0]
     anno = json.load(open(anno_path, 'r'))
     return anno[0]
 
 class InternVL8B:
-    def __init__(self, device_id=0):
+    def __init__(self, device_id=0, path='/data1/lgagent_0402/model_ckpt/InternVL3-8B'):
         self.device_id = device_id
         self.device    = f"cuda:{device_id}"
-        path = '/data1/lgagent_0402/model_ckpt/InternVL3-8B'
+        self.modelpath = path
         # device_map = self.split_model('InternVL3-8B')
         self.model = AutoModel.from_pretrained(
-            path,
+            self.modelpath,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             use_flash_attn=True,
             trust_remote_code=True,
             device_map=self.device).eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
-        self.generation_config = dict(max_new_tokens=64, do_sample=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.modelpath, trust_remote_code=True, use_fast=False)
+        self.generation_config = dict(max_new_tokens=64, do_sample=False)
     
     def get_model_name(self):
         return 'intern_8b'
@@ -174,7 +169,89 @@ class InternVL8B:
         pixel_values = torch.cat(pixel_values_list)
         return pixel_values, num_patches_list
 
-    def get_answer(self, video_path, query, sorted_frame_idx):
+    def chat(self, model, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
+             num_patches_list=None, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
+             verbose=False, return_logits=False):
+
+        if history is None and pixel_values is not None and '<image>' not in question:
+            question = '<image>\n' + question
+
+        if num_patches_list is None:
+            num_patches_list = [pixel_values.shape[0]] if pixel_values is not None else []
+        assert pixel_values is None or len(pixel_values) == sum(num_patches_list)
+
+        img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        model.img_context_token_id = img_context_token_id
+
+        template = internvl_conversation.get_conv_template(model.template)
+        template.system_message = model.system_message
+        eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
+
+        history = [] if history is None else history
+        for (old_question, old_answer) in history:
+            template.append_message(template.roles[0], old_question)
+            template.append_message(template.roles[1], old_answer)
+        template.append_message(template.roles[0], question)
+        template.append_message(template.roles[1], None)
+        query = template.get_prompt()
+
+        if verbose and pixel_values is not None:
+            image_bs = pixel_values.shape[0]
+            print(f'dynamic ViT batch size: {image_bs}')
+
+        for num_patches in num_patches_list:
+            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * model.num_image_token * num_patches + IMG_END_TOKEN
+            query = query.replace('<image>', image_tokens, 1)
+
+        model_inputs = tokenizer(query, return_tensors='pt')
+        input_ids = model_inputs['input_ids'].to(model.device)
+        attention_mask = model_inputs['attention_mask'].to(model.device)
+        generation_config['eos_token_id'] = eos_token_id
+        generation_output = model.generate(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict_in_generate=return_logits,
+            output_scores=return_logits,
+            **generation_config
+        )
+        
+        if return_logits: # logits is return
+            response = tokenizer.batch_decode(generation_output.sequences, skip_special_tokens=True)[0]
+            choice_tokens = ["A", "B", "C", "D", "E"]
+            choice_token_ids = [
+                                self.tokenizer.encode(c, add_special_tokens=False)[0]
+                                for c in choice_tokens
+                            ]
+            first_step_logits = generation_output.scores[0][0]
+            choice_logits = {
+                            c: first_step_logits[token_id].item()
+                            for c, token_id in zip(choice_tokens, choice_token_ids)
+                        }
+            choice_probs = F.softmax(first_step_logits[choice_token_ids], dim=-1)
+            choice_probs_dict = {
+                c: p.item() for c, p in zip(choice_tokens, choice_probs)
+            }
+            scores_cpu = [s.cpu().to(torch.float16) for s in generation_output.scores]
+        else:
+            response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
+        
+        response = response.split(template.sep.strip())[0].strip()
+        history.append((question, response))
+
+        if return_logits:
+            return response, history, scores_cpu, choice_probs_dict
+
+        if return_history:
+            return response, history, None, None
+        else:
+            query_to_print = query.replace(IMG_CONTEXT_TOKEN, '')
+            query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
+            if verbose:
+                print(query_to_print, response)
+            return response
+
+    def get_answer(self, video_path, query, sorted_frame_idx, return_logits=False):
 
         pv, np_list = self.load_video(video_path, frame_indices=sorted_frame_idx)
         pv = pv.to(torch.bfloat16).to(self.device)
@@ -183,21 +260,20 @@ class InternVL8B:
         ) + query
         # gen_cfg = dict(self.generation_config, do_sample=do_sample)
         gen_cfg = dict(self.generation_config)
-        response, _ = self.model.chat(
-            self.tokenizer, pv, question, gen_cfg,
-            num_patches_list=np_list, history=None, return_history=True,
+        response, _, logits, choice_probs = self.chat(
+            self.model, self.tokenizer, pv, question, gen_cfg,
+            num_patches_list=np_list, history=None, return_history=True, return_logits=return_logits
         )
         del pv
         torch.cuda.empty_cache()
-        return response
-
-    def get_text_answer(self, prompt: str) -> str:
-        gen_cfg = dict(self.generation_config)
-        response, _ = self.model.chat(
-            self.tokenizer, None, prompt, gen_cfg,
-            num_patches_list=None, history=None, return_history=True,
-        )
-        return response
+        
+        if not return_logits:
+            return response
+        return {
+            "text": response,
+            "option_probs": choice_probs,
+            "logits": logits,
+        }
     
     def get_text_answer(self, query):
 
@@ -287,7 +363,7 @@ class Eagle25Agent:
         return inputs
 
     def get_answer(self, video_path: str, prompt: str,
-                   sample_idx, do_sample: bool = True) -> str:
+                   sample_idx, do_sample: bool = False, return_logits=False) -> str:
         
         messages = [{
             "role": "user",
@@ -306,24 +382,45 @@ class Eagle25Agent:
         inputs = self.processor(text = text_list, images=image_inputs, videos=video_inputs, return_tensors="pt", padding=True, videos_kwargs=video_kwargs).to(self.device)
         
         with torch.inference_mode():
-            generated_ids = self.model.generate(**inputs, max_new_tokens=128)
-            # generated_ids = self.model.generate(
-            #     **inputs,
-            #     max_new_tokens=128,
-            #     do_sample=do_sample,
-            #     use_cache=True,
-            #     pad_token_id=151645,
-            #     eos_token_id=151645,
-            # )
-        # Eagle2.5 generate()는 inputs_embeds 기반이라
-        # output에 입력 토큰이 포함되지 않음 → trimming 불필요
+            generated_ids = self.model.generate(
+                                                **inputs, 
+                                                max_new_tokens=128, 
+                                                do_sample=False,
+                                                return_dict_in_generate=return_logits,
+                                                output_scores=return_logits,
+                                                )
+        if return_logits:
+            scores = generated_ids.scores
+            scores_cpu = [s.cpu().to(torch.float16) for s in scores]
+            choice_tokens = ["A", "B", "C", "D", "E"]
+            choice_token_ids = [
+                                self.processor.tokenizer.encode(c, add_special_tokens=False)[0]
+                                for c in choice_tokens
+                            ]
+            first_step_logits = scores[0][0]
+            choice_logits = {
+                            c: first_step_logits[token_id].item()
+                            for c, token_id in zip(choice_tokens, choice_token_ids)
+                        }
+            choice_probs = F.softmax(first_step_logits[choice_token_ids], dim=-1)
+            choice_probs_dict = {
+                c: p.item() for c, p in zip(choice_tokens, choice_probs)
+            }
+            generated_ids = generated_ids.sequences
+
         output_text = self.processor.batch_decode( generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False )
         raw_text = output_text[0] if output_text else ""
         del inputs, generated_ids
         torch.cuda.empty_cache()
 
-        return raw_text
-
+        if not return_logits:
+            return raw_text
+        return {
+            "text": raw_text,
+            "option_probs": choice_probs_dict,
+            "logits": scores_cpu,
+        }
+    
     def get_text_answer(self, prompt: str) -> str:
         # Eagle2.5: model.generate()는 멀티모달 입력 전용
         # 텍스트 전용은 language_model을 직접 사용해야 함
@@ -342,14 +439,13 @@ class Eagle25Agent:
                 attention_mask=inputs["attention_mask"],
                 max_new_tokens=128,
                 use_cache=True,
-                do_sample=True,
+                do_sample=False,
             )
         # inputs_embeds 기반 생성: output에 입력 포함 안됨 → trimming 불필요
         output_text = self.processor.batch_decode( generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False )
         del inputs, generated_ids
         torch.cuda.empty_cache()
         return output_text[0] if output_text else ""
-
 
 
 class Qwen3_8bAgent:
@@ -381,7 +477,7 @@ class Qwen3_8bAgent:
             return_tensors="pt"
         ).to(_first_dev)
         
-        generated_ids = self.model.generate(**inputs, max_new_tokens=64)
+        generated_ids = self.model.generate(**inputs, max_new_tokens=64,  do_sample=False)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
@@ -390,7 +486,7 @@ class Qwen3_8bAgent:
         )
         return output_text
 
-    def get_answer(self, video_path, text, sample_idx=None, multi_image_path= None):
+    def get_answer(self, video_path, text, sample_idx=None, multi_image_path= None, return_logits=False):
 
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=8)
         native_fps = vr.get_avg_fps()
@@ -420,8 +516,33 @@ class Qwen3_8bAgent:
 
         inputs = self.processor(text=[text], images=image_inputs, videos=video_inputs, video_metadata=video_metadatas, **video_kwargs, do_resize=False, return_tensors="pt").to(_first_dev)
         with torch.inference_mode():
-            output_ids = self.model.generate(**inputs, max_new_tokens=64)
+            output_ids = self.model.generate(
+                                            **inputs, 
+                                            max_new_tokens=64,  
+                                            do_sample=False,
+                                            return_dict_in_generate=return_logits,
+                                            output_scores=return_logits
+                                            )
             torch.cuda.empty_cache()
+        
+        if return_logits:
+            scores = output_ids.scores
+            scores_cpu = [s.cpu().to(torch.float16) for s in scores]
+            choice_tokens = ["A", "B", "C", "D", "E"]
+            choice_token_ids = [
+                                self.processor.tokenizer.encode(c, add_special_tokens=False)[0]
+                                for c in choice_tokens
+                            ]
+            first_step_logits = scores[0][0]
+            choice_logits = {
+                            c: first_step_logits[token_id].item()
+                            for c, token_id in zip(choice_tokens, choice_token_ids)
+                        }
+            choice_probs = F.softmax(first_step_logits[choice_token_ids], dim=-1)
+            choice_probs_dict = {
+                c: p.item() for c, p in zip(choice_tokens, choice_probs)
+            }
+            output_ids = output_ids.sequences
 
         
         generated_ids_trimmed = [
@@ -430,4 +551,11 @@ class Qwen3_8bAgent:
         output_text = self.processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        return output_text
+
+        if not return_logits:
+            return output_text
+        return {
+            "text": output_text,
+            "option_probs": choice_probs_dict,
+            "logits": scores_cpu,
+        }
