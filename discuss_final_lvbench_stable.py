@@ -303,6 +303,8 @@ def get_result_second_round(agent_set, anno, history_info=None, anno_idx=0, base
 
         if not isinstance(result, str):
             result_text = str(result)
+        else:
+            result_text = result
 
         if isinstance(result, dict):
             result_text = result["text"]
@@ -310,6 +312,8 @@ def get_result_second_round(agent_set, anno, history_info=None, anno_idx=0, base
             option_logits = result["option_probs"]
             logits_dict[agent_name] = logits
             option_logits_dict[agent_name] = option_logits
+            if isinstance(result_text, list):
+                result_text = result_text[0] if result_text else 'N'
 
         result_text = result_text.strip()
 
@@ -327,6 +331,7 @@ def get_result_second_round(agent_set, anno, history_info=None, anno_idx=0, base
 
     threads = []
     for agent in agent_set:
+        # process_agent(agent)
         thread = threading.Thread(target=process_agent, args=(agent,))
         threads.append(thread)
         thread.start()
@@ -412,7 +417,6 @@ def agent_back_process(agent_set, data):
                 score += int(sub_dict[model])
         scores[model] = score
     
-    # priority_order = ['intern_8b', 'llava_72b', 'intern_78b']
     priority_order = ['intern_8b', 'qwen3vl_8b', 'eagle25_8b']
     min_score = min(scores.values())
     lowest_score_keys = [key for key, score in scores.items() if score == min_score]
@@ -537,17 +541,18 @@ def write_json(data, path):
 if __name__ == "__main__":
     set_seed(42)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--save_path", type=str, default="./lvbench_anno_stable_0406.json")
+    parser.add_argument("--save_path", type=str, default="./tmp.json")
     parser.add_argument("--save_logits_path", type=str, default="./logits")
     parser.add_argument("--anno_path", type=str, default="./anno_org/lvbench_anno.json")
     parser.add_argument("--return_logits", action='store_true')
     
     outargs    = parser.parse_args()
-    if not os.path.exists(outargs.save_logits_path):
-        os.makedirs(outargs.save_logits_path)
-        os.makedirs(os.path.join(outargs.save_logits_path, "first"))
-        os.makedirs(os.path.join(outargs.save_logits_path, "second"))
-        os.makedirs(os.path.join(outargs.save_logits_path, "third"))
+    if outargs.return_logits:
+        if not os.path.exists(outargs.save_logits_path):
+            os.makedirs(outargs.save_logits_path)
+            os.makedirs(os.path.join(outargs.save_logits_path, "first"))
+            os.makedirs(os.path.join(outargs.save_logits_path, "second"))
+            os.makedirs(os.path.join(outargs.save_logits_path, "third"))
 
     internvl8b = InternVL8B()
     eagle7b = Eagle25Agent()
@@ -581,12 +586,21 @@ if __name__ == "__main__":
         print(f"\nThe answer is : {chr(ord('A') + anno['correct_choice'])}")
         
         anno['first_round'] = {}
+        anno['first_round']['answer_dict'] = answer_dict
         if outargs.return_logits:
             for k_, v_ in logits_dict.items():
                 pt_save_path = os.path.join(outargs.save_logits_path, "first", f"{idx}_{k_}.pt")
                 torch.save(logits_dict[k_][0], pt_save_path)
             anno['first_round']['logits_path'] = pt_save_path
             anno['first_round']['option_logits_dict'] = option_logits_dict
+        reason_dict = reason_process(agent_set, anno, answer_dict, anno_idx=idx, base_seed=BASE_SEED)
+        discuss_dict = discuss_text_process(agent_set, anno, answer_dict, reason_dict)
+        new_data, lowest_score_key, scores = agent_back_process(agent_set, discuss_dict)
+        history_info = generate_history_info(agent_set, anno, new_data, lowest_score_key, scores, reason_dict, answer_dict)
+        anno['first_round']['scores'] = scores
+        anno['first_round']['reason_dict'] = reason_dict
+        anno['first_round']['discuss_dict'] = discuss_dict
+        anno['first_round']['history_info'] = history_info
 
         # majority cutting
         if len(answer_set) < 3:
@@ -605,17 +619,7 @@ if __name__ == "__main__":
                 correct += 1
             print("\n[End at 1st round] correct/total: {}/{}, Acc: {}\n".format(correct, idx+1, correct / (idx+1)))
             write_json(anno_data, outargs.save_path)
-
-        reason_dict = reason_process(agent_set, anno, answer_dict, anno_idx=idx, base_seed=BASE_SEED)
-        discuss_dict = discuss_text_process(agent_set, anno, answer_dict, reason_dict)
-        new_data, lowest_score_key, scores = agent_back_process(agent_set, discuss_dict)
-        history_info = generate_history_info(agent_set, anno, new_data, lowest_score_key, scores, reason_dict, answer_dict)
-        anno['first_round']['answer_dict'] = answer_dict
-        anno['first_round']['scores'] = scores
-        anno['first_round']['reason_dict'] = reason_dict
-        anno['first_round']['discuss_dict'] = discuss_dict
-        anno['first_round']['history_info'] = history_info
-
+            continue
 
         new_agent_set = []
         for agent in agent_set:
@@ -637,6 +641,17 @@ if __name__ == "__main__":
             anno['second_round']['logits_path'] = pt_save_path
             anno['second_round']['option_logits_dict'] = option_logits_dict
 
+        print(answer_dict, chr(ord('A') + anno['correct_choice']))
+        reason_dict = reason_process(agent_set, anno, answer_dict, anno_idx=idx, base_seed=BASE_SEED)
+        discuss_dict = discuss_text_process(agent_set, anno, answer_dict, reason_dict)
+        new_data, lowest_score_key, scores = agent_back_process(agent_set, discuss_dict)
+        history_info = generate_history_info(agent_set, anno, new_data, lowest_score_key, scores, reason_dict, answer_dict)
+        anno['second_round']['answer_dict'] = answer_dict
+        anno['second_round']['scores'] = scores
+        anno['second_round']['reason_dict'] = reason_dict
+        anno['second_round']['discuss_dict'] = discuss_dict
+        anno['second_round']['history_info'] = history_info
+
         if len(answer_set) == 1:
             answer_set = next(iter(answer_set))
             answer_set = str(answer_set)
@@ -651,16 +666,6 @@ if __name__ == "__main__":
             write_json(anno_data, outargs.save_path)
             continue
         
-        print(answer_dict, chr(ord('A') + anno['correct_choice']))
-        reason_dict = reason_process(agent_set, anno, answer_dict, anno_idx=idx, base_seed=BASE_SEED)
-        discuss_dict = discuss_text_process(agent_set, anno, answer_dict, reason_dict)
-        new_data, lowest_score_key, scores = agent_back_process(agent_set, discuss_dict)
-        history_info = generate_history_info(agent_set, anno, new_data, lowest_score_key, scores, reason_dict, answer_dict)
-        anno['second_round']['answer_dict'] = answer_dict
-        anno['second_round']['scores'] = scores
-        anno['second_round']['reason_dict'] = reason_dict
-        anno['second_round']['discuss_dict'] = discuss_dict
-        anno['second_round']['history_info'] = history_info
         new_agent_set = []
         for agent in agent_set:
             if agent.get_model_name() in new_data:
