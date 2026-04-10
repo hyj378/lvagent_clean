@@ -237,6 +237,9 @@ def get_result_first_round(agent_set, anno, anno_idx, base_seed = 42, return_log
         else:
             result_text = result
 
+        if result_text is None:
+                result_text = 'N'
+
         if isinstance(result_text, list):
             result_text = result_text[0]
 
@@ -277,7 +280,6 @@ def get_result_second_round(agent_set, anno, history_info=None, anno_idx=0, base
         watch = anno[agent_name]['watch'][0] if isinstance(anno[agent_name]['watch'], list) else anno[agent_name]['watch']
 
         if 'Yes' in watch:
-
             sample_idx = get_frame_idx_path(video_path, round=0, sample_frame=16, rng=agent_rng)
             result = agent.get_answer(video_path, get_mme_answer, sample_idx, return_logits=return_logits)
         else:
@@ -314,6 +316,8 @@ def get_result_second_round(agent_set, anno, history_info=None, anno_idx=0, base
             option_logits_dict[agent_name] = option_logits
             if isinstance(result_text, list):
                 result_text = result_text[0] if result_text else 'N'
+            elif result_text is None:
+                result_text = 'N'
 
         result_text = result_text.strip()
 
@@ -354,8 +358,26 @@ def reason_process(agent_set, anno, answer_dict, sample_idx=None, history_info=N
         agent_name = agent.get_model_name()
         agent_rng = make_agent_rng(base_seed, anno_idx, agent_name, "reason_process")
 
+        # reason_prompt = "Given the video frames you've seen, and the question along with your answer, deeply analyze the logical steps and evidence from the frames that led you to provide this particular answer. The Question is: {}\n, The predict answer is {}\n.".format(
+        #     anno['question'], anno['candidates'][ord(answer_dict[agent_name]) - ord('A')])
+
+        pred = answer_dict.get(agent_name, 'N')
+        if isinstance(pred, str):
+            pred = pred.strip().upper()
+        else:
+            pred = 'N'
+        if len(pred) == 1 and 'A' <= pred <= 'E':
+            idx = ord(pred) - ord('A')
+            if idx < len(anno['candidates']):
+                pred_text = anno['candidates'][idx]
+            else:
+                pred_text = "The wrong answer."
+        else:
+            pred_text = "The wrong answer."
+
         reason_prompt = "Given the video frames you've seen, and the question along with your answer, deeply analyze the logical steps and evidence from the frames that led you to provide this particular answer. The Question is: {}\n, The predict answer is {}\n.".format(
-            anno['question'], anno['candidates'][ord(answer_dict[agent_name]) - ord('A')])
+            anno['question'], pred_text)
+
         if 'sample_idx' not in anno[agent_name]:
             rand_block = agent_rng.randint(1, 6)
             local_sample_idx = get_frame_idx_path(video_path, round=rand_block, sample_frame=16, judge_whole=True, rng=agent_rng)
@@ -593,15 +615,7 @@ if __name__ == "__main__":
                 torch.save(logits_dict[k_][0], pt_save_path)
             anno['first_round']['logits_path'] = pt_save_path
             anno['first_round']['option_logits_dict'] = option_logits_dict
-        reason_dict = reason_process(agent_set, anno, answer_dict, anno_idx=idx, base_seed=BASE_SEED)
-        discuss_dict = discuss_text_process(agent_set, anno, answer_dict, reason_dict)
-        new_data, lowest_score_key, scores = agent_back_process(agent_set, discuss_dict)
-        history_info = generate_history_info(agent_set, anno, new_data, lowest_score_key, scores, reason_dict, answer_dict)
-        anno['first_round']['scores'] = scores
-        anno['first_round']['reason_dict'] = reason_dict
-        anno['first_round']['discuss_dict'] = discuss_dict
-        anno['first_round']['history_info'] = history_info
-
+        
         # majority cutting
         if len(answer_set) < 3:
             values = list(answer_dict.values())
@@ -620,6 +634,17 @@ if __name__ == "__main__":
             print("\n[End at 1st round] correct/total: {}/{}, Acc: {}\n".format(correct, idx+1, correct / (idx+1)))
             write_json(anno_data, outargs.save_path)
             continue
+
+
+        reason_dict = reason_process(agent_set, anno, answer_dict, anno_idx=idx, base_seed=BASE_SEED)
+        discuss_dict = discuss_text_process(agent_set, anno, answer_dict, reason_dict)
+        new_data, lowest_score_key, scores = agent_back_process(agent_set, discuss_dict)
+        history_info = generate_history_info(agent_set, anno, new_data, lowest_score_key, scores, reason_dict, answer_dict)
+
+        anno['first_round']['scores'] = scores
+        anno['first_round']['reason_dict'] = reason_dict
+        anno['first_round']['discuss_dict'] = discuss_dict
+        anno['first_round']['history_info'] = history_info
 
         new_agent_set = []
         for agent in agent_set:
