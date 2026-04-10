@@ -442,7 +442,15 @@ class Eagle25Agent:
                 do_sample=False,
             )
         # inputs_embeds 기반 생성: output에 입력 포함 안됨 → trimming 불필요
-        output_text = self.processor.batch_decode( generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False )
+        # 변경 후 — input 길이만큼 앞을 잘라내고 decode
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+        ]
+        output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False )
+
+
+        # output_text = self.processor.batch_decode( generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False )
         del inputs, generated_ids
         torch.cuda.empty_cache()
         return output_text[0] if output_text else ""
